@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import csv
-import hashlib
 import json
 import math
 from dataclasses import dataclass, replace
@@ -23,61 +22,15 @@ from adaptive_rl.evaluation.metrics import (
     compute_trajectory_metrics,
 )
 from adaptive_rl.evaluation.statistics import MetricStatistics, summarize_seed_values
-
-
-def derive_episode_reset_seed(
-    evaluation_group_seed: int,
-    episode_index: int,
-    *,
-    split: Optional[str] = None,
-) -> int:
-    """Derive a stable reset seed from a seed group and episode index.
-
-    For custom distributions, Cantor pairing maps every non-negative integer
-    pair injectively to a non-negative integer:
-    ``((g + i) * (g + i + 1)) // 2 + i``. It is independent of the requested
-    episode count and does not use Python's randomized ``hash``.
-
-    Configured train/test splits have finite seed namespaces, so a SHA-256
-    digest is reduced into that split's documented interval. Sampling with
-    replacement is possible in these finite partitions and is identified in
-    the benchmark metadata.
-    """
-    if isinstance(evaluation_group_seed, bool) or not isinstance(evaluation_group_seed, int):
-        raise ValueError("Evaluation group seed must be an integer.")
-    if evaluation_group_seed < 0:
-        raise ValueError("Evaluation group seed must be non-negative.")
-    if isinstance(episode_index, bool) or not isinstance(episode_index, int):
-        raise ValueError("Episode index must be an integer.")
-    if episode_index < 0:
-        raise ValueError("Episode index must be non-negative.")
-
-    if split is None:
-        total = evaluation_group_seed + episode_index
-        return total * (total + 1) // 2 + episode_index
-
-    from adaptive_rl.evaluation.generalization import (
-        TEST_SEED_END,
-        TEST_SEED_START,
-        TRAIN_SEED_END,
-        TRAIN_SEED_START,
-        validate_split_seed,
-    )
-
-    clean_split = split.strip().lower()
-    if clean_split == "train":
-        start, end = TRAIN_SEED_START, TRAIN_SEED_END
-    elif clean_split == "test":
-        start, end = TEST_SEED_START, TEST_SEED_END
-    else:
-        raise ValueError(f"Unknown evaluation split {split!r}.")
-    validate_split_seed(evaluation_group_seed, clean_split)
-    capacity = end - start
-    payload = (
-        f"adaptive-rl-evaluation-reset-v1:{clean_split}:{evaluation_group_seed}:{episode_index}"
-    )
-    digest = hashlib.sha256(payload.encode("ascii")).digest()
-    return start + int.from_bytes(digest[:8], "big") % capacity
+from adaptive_rl.seeds import (
+    SEED_ALLOCATION_PROTOCOL,
+    SEED_ALLOCATION_VERSION,
+    SPLIT_INTERVALS,
+    allocate_episode_reset_seeds,
+    validate_episodes_per_group,
+    validate_seed,
+    validate_seed_groups,
+)
 
 
 @dataclass(frozen=True)
@@ -198,8 +151,9 @@ class MultiSeedEvaluationResult:
     """Complete multi-seed result retaining episodes and seed-level identity.
 
     ``seeds`` are evaluation group seeds; each group runs
-    ``episodes_per_seed`` episodes whose actual reset seeds are derived from
-    the group seed and recorded per episode as ``episode_reset_seed``.
+    ``episodes_per_seed`` episodes whose actual reset seeds are allocated to
+    disjoint blocks for the sorted group list and recorded per episode as
+    ``episode_reset_seed``.
     """
 
     seeds: list[int]
@@ -209,6 +163,65 @@ class MultiSeedEvaluationResult:
     episodes: list[EpisodeEvaluationRecord]
     aggregate: dict[str, MetricStatistics]
     environment: str
+    split: str
+
+    def __post_init__(self) -> None:
+        self._validate_seed_contract()
+
+    def _validate_seed_contract(self) -> None:
+        if self.split not in SPLIT_INTERVALS:
+            raise ValueError(f"Invalid evaluation split {self.split!r}.")
+        groups = validate_seed_groups(
+            self.seeds, split=None if self.split == "custom" else self.split
+        )
+        if groups != self.seeds:
+            raise ValueError("Evaluation group seeds must be stored in ascending order.")
+        episode_count = validate_episodes_per_group(self.episodes_per_seed)
+        allocation = allocate_episode_reset_seeds(groups, episode_count, split=self.split)
+        if [summary.evaluation_group_seed for summary in self.per_seed] != groups:
+            raise ValueError(
+                "Per-seed summaries must contain one entry per ordered evaluation group."
+            )
+
+        expected_records = {
+            (group, index): reset_seed
+            for group in groups
+            for index, reset_seed in enumerate(allocation[group])
+        }
+        observed: dict[tuple[int, int], int] = {}
+        for record in self.episodes:
+            group = validate_seed(record.evaluation_group_seed, label="Episode group seed")
+            if isinstance(record.episode_index, bool) or not isinstance(record.episode_index, int):
+                raise ValueError("Episode indices must be integers.")
+            reset_seed = validate_seed(record.episode_reset_seed, label="Episode reset seed")
+            key = (group, record.episode_index)
+            if key not in expected_records or expected_records[key] != reset_seed:
+                raise ValueError("Episode record does not match the declared seed allocation.")
+            if key in observed:
+                raise ValueError(f"Duplicate episode record for group/index {key}.")
+            observed[key] = reset_seed
+
+        if observed != expected_records:
+            raise ValueError("Episode records must contain every allocated group/episode pair.")
+        reset_seeds = list(observed.values())
+        if len(reset_seeds) != len(set(reset_seeds)):
+            raise ValueError(
+                "Student-t intervals require disjoint reset-seed blocks between evaluation groups."
+            )
+        if any(summary.episodes != episode_count for summary in self.per_seed):
+            raise ValueError("Each evaluation group summary must cover episodes_per_seed episodes.")
+        if any(not 0 <= stat.sample_count <= len(groups) for stat in self.aggregate.values()):
+            raise ValueError(
+                "Cross-group statistics cannot contain more samples than evaluation groups."
+            )
+        for stat in self.aggregate.values():
+            has_interval = stat.ci95_lower is not None and stat.ci95_upper is not None
+            if has_interval != (stat.sample_count >= 2) or (
+                (stat.ci95_lower is None) != (stat.ci95_upper is None)
+            ):
+                raise ValueError(
+                    "Student-t intervals require at least two independent group samples."
+                )
 
     @property
     def total_episodes(self) -> int:
@@ -220,6 +233,7 @@ class MultiSeedEvaluationResult:
         return list(self.seeds)
 
     def to_dict(self) -> dict[str, Any]:
+        self._validate_seed_contract()
         return {
             "metadata": {
                 "seeds": list(self.seeds),
@@ -227,21 +241,28 @@ class MultiSeedEvaluationResult:
                 "seed_count": len(self.seeds),
                 "seed_semantics": (
                     "seeds are evaluation group seeds (the statistical grouping unit); "
-                    "episodes within a group use derived episode_reset_seed values"
+                    "episodes within a group use allocated episode_reset_seed values"
                 ),
-                "episode_reset_seed_mapping": (
-                    "custom: Cantor pairing ((group_seed + episode_index) * "
-                    "(group_seed + episode_index + 1)) // 2 + episode_index; "
-                    "configured split: SHA-256 of "
-                    "'adaptive-rl-evaluation-reset-v1:<split>:<group_seed>:<episode_index>' "
-                    "reduced into the finite split interval"
+                "evaluation_split": self.split,
+                "seed_allocation": {
+                    "protocol": SEED_ALLOCATION_PROTOCOL,
+                    "version": SEED_ALLOCATION_VERSION,
+                    "list_dependent": True,
+                },
+                "independence_assumption": (
+                    "each Student-t observation is one evaluation group; group reset-seed blocks "
+                    "are disjoint, while within-group episodes are not independent observations"
                 ),
                 "episodes_per_seed": self.episodes_per_seed,
                 "total_episodes": self.total_episodes,
                 "deterministic": self.deterministic,
                 "environment": self.environment,
-                "confidence_interval": "two-sided 95% Student's t interval across seed summaries; "
-                "sample standard deviation; unavailable when fewer than two values exist",
+                "confidence_interval": (
+                    "two-sided 95% Student's t interval using one summary per independent "
+                    "evaluation group and sample standard deviation; assumes group summaries "
+                    "are independently sampled and groups use disjoint reset-seed blocks; "
+                    "unavailable when fewer than two non-missing group values exist"
+                ),
                 "duplicate_seed_policy": "rejected",
             },
             "episodes": [record.to_dict() for record in self.episodes],
@@ -313,6 +334,9 @@ class Evaluator:
         if split is not None:
             from adaptive_rl.evaluation.generalization import get_split_seeds, validate_split_seed
 
+            if not isinstance(split, str) or split.strip().lower() not in ("train", "test"):
+                raise ValueError("Evaluation split must be one of 'train' or 'test'.")
+            split = split.strip().lower()
             if seeds is None:
                 seeds = get_split_seeds(split, num_episodes=num_episodes)
             else:
@@ -321,10 +345,18 @@ class Evaluator:
 
         if seeds is not None:
             seeds = list(seeds)
+            for reset_seed_value in seeds:
+                validate_seed(reset_seed_value, label="Episode reset seed")
             num_episodes = len(seeds)
 
+        if isinstance(num_episodes, bool) or not isinstance(num_episodes, int):
+            raise ValueError("num_episodes must be a positive integer.")
         if num_episodes <= 0:
             raise ValueError(f"num_episodes must be positive, got {num_episodes}")
+        if base_seed is not None:
+            validate_seed(base_seed, label="Base seed")
+            if seeds is None:
+                validate_seed(base_seed + num_episodes - 1, label="Last episode seed")
 
         self.last_episode_records = []
         rewards: List[float] = []
@@ -344,13 +376,11 @@ class Evaluator:
         max_accelerations: List[float] = []
 
         for ep in range(num_episodes):
+            seed: int | None = None
             if seeds is not None:
                 seed = seeds[ep]
             elif base_seed is not None:
                 seed = base_seed + ep
-            else:
-                seed = None
-
             reset_options = {"split": split} if split is not None else None
             if reset_options is not None:
                 try:
@@ -606,43 +636,51 @@ class Evaluator:
     ) -> MultiSeedEvaluationResult:
         """Evaluate a policy independently for each explicit seed group.
 
-        ``seeds`` are evaluation group seeds: the statistical grouping unit
-        for cross-seed summaries. Each group runs ``episodes_per_seed``
-        episodes whose actual ``env.reset`` seeds are derived independently of
-        ``episodes_per_seed``. Custom seeds use injective Cantor pairing;
-        configured finite splits use a split-bounded SHA-256 mapping.
+        ``seeds`` are evaluation group identifiers and the statistical unit
+        for cross-group Student-t summaries. Their values and episode count
+        are validated before touching the environment. Reset seeds are assigned
+        from non-overlapping fixed-width blocks in the selected seed interval.
+        The sorted group list determines the block ranks; increasing the episode
+        count does not change existing assignments, but changing the group list
+        can change them.
 
         Duplicate seeds are rejected because repeated entries do not represent
         independent test conditions and would over-weight that environment.
         """
-        seed_values = list(seeds)
-        if not seed_values:
-            raise ValueError("Evaluation seeds must not be empty.")
-        if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in seed_values):
-            raise ValueError("Evaluation seeds must be integers.")
-        if any(seed < 0 for seed in seed_values):
-            raise ValueError("Evaluation seeds must be non-negative.")
-        if len(set(seed_values)) != len(seed_values):
-            raise ValueError("Evaluation seeds must be unique; duplicate seeds are not allowed.")
+        if split is not None and not isinstance(split, str):
+            raise ValueError("Evaluation split must be one of 'custom', 'train', or 'test'.")
+        clean_split = "custom" if split is None else split.strip().lower()
+        if clean_split not in ("custom", "train", "test"):
+            raise ValueError("Evaluation split must be one of 'custom', 'train', or 'test'.")
+        split_for_environment = None if clean_split == "custom" else clean_split
+        seed_values = validate_seed_groups(
+            list(seeds), split=None if clean_split == "custom" else clean_split
+        )
         if isinstance(episodes_per_seed, bool) or not isinstance(episodes_per_seed, int):
-            raise ValueError("episodes_per_seed must be an integer.")
+            raise ValueError("episodes_per_seed must be a positive integer.")
         if episodes_per_seed <= 0:
             raise ValueError(f"episodes_per_seed must be positive, got {episodes_per_seed}.")
         if not isinstance(deterministic, bool):
             raise ValueError("deterministic must be a boolean.")
 
+        reset_seeds_by_group = allocate_episode_reset_seeds(
+            seed_values, episodes_per_seed, split=clean_split
+        )
+        all_reset_seeds = [
+            reset_seed for group in seed_values for reset_seed in reset_seeds_by_group[group]
+        ]
+        if len(all_reset_seeds) != len(set(all_reset_seeds)):
+            raise RuntimeError("Seed allocation protocol produced overlapping group reset seeds.")
+
         all_records: list[EpisodeEvaluationRecord] = []
         seed_summaries: list[SeedEvaluationSummary] = []
         for seed in seed_values:
-            reset_seeds = [
-                derive_episode_reset_seed(seed, index, split=split)
-                for index in range(episodes_per_seed)
-            ]
+            reset_seeds = reset_seeds_by_group[seed]
             metrics = self.evaluate(
                 num_episodes=episodes_per_seed,
                 deterministic=deterministic,
                 seeds=reset_seeds,
-                split=split,
+                split=split_for_environment,
             )
             records = [
                 replace(
@@ -698,6 +736,7 @@ class Evaluator:
             episodes=all_records,
             aggregate=aggregate,
             environment=self.env_name,
+            split=clean_split,
         )
 
     @staticmethod

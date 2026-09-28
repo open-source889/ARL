@@ -150,10 +150,16 @@ def student_t_critical_value(confidence: float, degrees_of_freedom: int) -> floa
 
 
 def summarize_seed_values(values: Sequence[float | None]) -> MetricStatistics:
-    """Summarize independent seed-level values using sample standard deviation.
+    """Summarize one value per independent evaluation group.
 
     Missing values are excluded metric-by-metric. CI bounds are unavailable
     unless at least two finite seed-level observations are present.
+
+    The caller must supply exactly one summary per evaluation group, not one
+    value per episode. ``Evaluator.evaluate_seeds`` verifies disjoint reset
+    seed blocks before using this function; the Student-t interval still
+    assumes independently sampled groups from the target environment
+    distribution.
     """
     observed: list[float] = []
     for value in values:

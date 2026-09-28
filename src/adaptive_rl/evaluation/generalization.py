@@ -21,15 +21,16 @@ from adaptive_rl.algorithms.base import BaseAlgorithm
 from adaptive_rl.environments.drone import DroneNavigation3DEnv
 from adaptive_rl.evaluation.evaluator import Evaluator
 from adaptive_rl.evaluation.metrics import EvaluationMetrics
+from adaptive_rl.seeds import (
+    TEST_SEED_END,
+    TEST_SEED_START,
+    TRAIN_SEED_END,
+    TRAIN_SEED_START,
+    validate_seed,
+)
 
 # Single source of truth for benchmark seed partitioning.
 # Half-open intervals: [start, end) where end is exclusive.
-TRAIN_SEED_START: int = 0
-TRAIN_SEED_END: int = 1000  # 1000 deterministic training seeds: 0..999
-
-TEST_SEED_START: int = 1000
-TEST_SEED_END: int = 1200  # 200 deterministic unseen test seeds: 1000..1199
-
 VALID_SPLITS: Tuple[str, ...] = ("train", "test")
 
 
@@ -43,6 +44,9 @@ def is_seed_in_split(seed: int, split: str) -> bool:
     Returns:
         True if seed is inside the split's half-open range, False otherwise.
     """
+    validate_seed(seed, label="Seed")
+    if not isinstance(split, str):
+        raise ValueError("Split must be one of: train, test.")
     clean_split = split.strip().lower()
     if clean_split == "train":
         return TRAIN_SEED_START <= seed < TRAIN_SEED_END
@@ -61,6 +65,9 @@ def validate_split_seed(seed: int, split: str) -> None:
     Raises:
         ValueError: If split is unknown or seed falls outside the split partition.
     """
+    validate_seed(seed, label="Seed")
+    if not isinstance(split, str):
+        raise ValueError("Split must be one of: train, test.")
     clean_split = split.strip().lower()
     if not is_seed_in_split(seed, clean_split):
         if clean_split == "train":
@@ -89,6 +96,8 @@ def get_split_seeds(split: str, num_episodes: Optional[int] = None) -> List[int]
     Raises:
         ValueError: If split is invalid or num_episodes is <= 0 or exceeds partition capacity.
     """
+    if not isinstance(split, str):
+        raise ValueError("Split must be one of: train, test.")
     clean_split = split.strip().lower()
     if clean_split == "train":
         start, end = TRAIN_SEED_START, TRAIN_SEED_END
@@ -99,6 +108,8 @@ def get_split_seeds(split: str, num_episodes: Optional[int] = None) -> List[int]
 
     max_capacity = end - start
     if num_episodes is not None:
+        if isinstance(num_episodes, bool) or not isinstance(num_episodes, int):
+            raise ValueError("num_episodes must be a positive integer.")
         if num_episodes <= 0:
             raise ValueError(f"num_episodes must be positive, got {num_episodes}")
         if num_episodes > max_capacity:

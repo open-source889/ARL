@@ -78,7 +78,7 @@ AdaptiveRL is an educational reinforcement-learning project in which a PPO agent
 - **Untrained Random Policy Baseline**: Built-in non-learning baseline to scientifically validate policy improvement.
 - **Obstacle-Density Experiment**: Controlled testing across 4, 6, and 8 obstacles to demonstrate environmental difficulty scaling.
 - **PPO Learning-Curve Benchmark**: Train fresh PPO models across configurable timestep budgets and export evaluation metrics as JSON/CSV with optional Matplotlib plots (`--plot`, `--plot-x-axis`).
-- **Command-Line Interface (CLI)**: Typer-based CLI for training, evaluation, learning-curve benchmarking, environment inspection, and trajectory demonstration.
+- **Command-Line Interface (CLI)**: Typer-based CLI for training, evaluation, environment inspection, and trajectory demonstration.
 - **Streamlit + Plotly 3D GUI**: Interactive browser-based presentation flight deck with a trajectory playback scrubber and live sensor visualization.
 - **Training Checkpoints**: Automatic model weight checkpointing (`.zip`) and JSON metadata export.
 - **Automated Test Suite**: Unit and integration tests verify kinematics, environment spaces, training lifecycle, benchmark outputs, and GUI charts.
@@ -447,7 +447,7 @@ adaptive-rl evaluate --help
 
 ### Run the PPO Learning-Curve Budget Benchmark
 
-Train a fresh PPO model at each timestep budget and evaluate every model under identical evaluation conditions (PPO only):
+**Each budget is a fresh, independent PPO run, not a checkpoint along a single run.** The plotted learning curve is empirical; a larger budget is not guaranteed to improve any metric. Train a fresh PPO model at each timestep budget and evaluate every model under identical evaluation conditions (PPO only):
 
 ```bash
 adaptive-rl benchmark budgets \
@@ -461,7 +461,9 @@ adaptive-rl benchmark budgets \
 
 Machine-readable results are written to `artifacts/benchmarks/learning_curve_budget.json` and `learning_curve_budget.csv`, with one saved model per budget. The JSON reports `status`, `completed_budgets`, `failed_budget`, and `error`, so a partially completed run is never mistaken for a complete one; the command exits non-zero when a budget fails and keeps the artifacts of every budget that finished.
 
-Each budget starts from the same configuration, training seed, and evaluation settings, but trains a fresh model and environment lifecycle. Evaluation group seeds identify statistical groups; reset seeds for their episodes are derived independently of the requested episode count. JSON records the evaluation split, environment-configuration fingerprint, and runtime/library versions. Repeatability is intended within a fixed software/hardware stack, but bit-for-bit training results are not guaranteed across devices, library versions, or nondeterministic accelerator kernels.
+Each budget uses the same configuration, training seed, and evaluation settings, but a fresh model and environment lifecycle. An evaluation group is one statistical observation; each episode uses a separate environment reset seed. Reset seeds are allocated as disjoint contiguous blocks to group seeds sorted in ascending order. The block width depends on the complete group list but not on the episode count, so increasing episodes preserves existing assignments; adding or removing a group may change them. An allocation that exceeds the selected split's capacity fails before environment creation or training.
+
+For `custom`, reset seeds use the unsigned 32-bit seed domain `[0, 2**32-1]`. The `train` and held-out `test` intervals are `[0, 1000)` and `[1000, 1200)`; the test interval therefore supports at most 200 total reset seeds. For example, five test groups support at most 40 episodes per group. Split evaluation requires the training environment to use `split: train`, and the evaluation group seeds must belong to the requested split. JSON records the versioned allocation protocol, environment-configuration fingerprint, and runtime/library versions. Reproduction means using the same sorted group set, episode count, configuration, and software/hardware stack; training is not guaranteed bit-for-bit across hardware, library versions, or nondeterministic accelerator kernels. Student-t intervals use one summary per group and assume independently sampled groups; episode observations within a group are not treated as independent samples.
 
 Add `--plot` to render `learning_curve_budget.png`. Plotting uses the optional Matplotlib extra:
 

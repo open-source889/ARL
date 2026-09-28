@@ -18,6 +18,7 @@ from rich.table import Table
 import adaptive_rl
 from adaptive_rl.config import ConfigError, load_config
 from adaptive_rl.environments.registry import RegistryError, make_env
+from adaptive_rl.seeds import SPLIT_INTERVALS, validate_seed, validate_seed_groups
 
 app = typer.Typer(
     name="adaptive-rl",
@@ -474,9 +475,6 @@ def evaluate(
     if num_episodes <= 0:
         console.print("[bold red]Evaluation episodes must be positive.[/bold red]")
         raise typer.Exit(code=1)
-    if seed is not None and seed < 0:
-        console.print("[bold red]Evaluation seed must be non-negative.[/bold red]")
-        raise typer.Exit(code=1)
     if seeds is not None and seed is not None:
         console.print("[bold red]Use either --seed or --seeds, not both.[/bold red]")
         raise typer.Exit(code=1)
@@ -497,6 +495,22 @@ def evaluate(
         exp_config.environment.parameters["split"] = clean_split
     else:
         clean_split = None
+
+    try:
+        if seeds is not None:
+            seeds = validate_seed_groups(seeds)
+        else:
+            validate_seed(exp_config.seed if seed is None else seed, label="Evaluation seed")
+        if clean_split is not None:
+            split_capacity = SPLIT_INTERVALS[clean_split][1] - SPLIT_INTERVALS[clean_split][0]
+            if num_episodes > split_capacity:
+                raise ValueError(
+                    f"Requested {num_episodes} episodes, but the {clean_split!r} split "
+                    f"has capacity {split_capacity}; reduce --episodes."
+                )
+    except ValueError as err:
+        console.print(f"[bold red]Invalid evaluation settings:[/bold red] {err}")
+        raise typer.Exit(code=1)
 
     # Resolve model path
     if model is None:

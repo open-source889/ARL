@@ -22,6 +22,13 @@ from pydantic import (
     model_validator,
 )
 
+from adaptive_rl.seeds import (
+    MAX_SEED,
+    allocate_episode_reset_seeds,
+    validate_seed,
+    validate_seed_groups,
+)
+
 
 class ConfigError(Exception):
     """Exception raised for configuration parsing or validation failures."""
@@ -41,6 +48,12 @@ class AlgorithmConfig(BaseModel):
     parameters: Dict[str, Any] = Field(
         default_factory=dict, description="Additional algorithm-specific hyperparameters"
     )
+
+    @model_validator(mode="after")
+    def _validate_optional_algorithm_seed(self) -> AlgorithmConfig:
+        if "seed" in self.parameters:
+            validate_seed(self.parameters["seed"], label="Algorithm seed")
+        return self
 
     @model_validator(mode="before")
     @classmethod
@@ -87,7 +100,7 @@ class EvaluationConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    eval_episodes: int = Field(20, gt=0, description="Number of evaluation episodes")
+    eval_episodes: StrictInt = Field(20, gt=0, description="Number of evaluation episodes")
     deterministic: bool = Field(
         True, description="Whether to use deterministic actions in evaluation"
     )
@@ -110,13 +123,18 @@ class BenchmarkConfig(BaseModel):
         min_length=1,
         description="Training budgets used for the learning-curve benchmark.",
     )
-    training_seed: int = Field(42, ge=0, description="Seed used for all benchmark training runs")
+    training_seed: StrictInt = Field(
+        42,
+        ge=0,
+        le=MAX_SEED,
+        description="Unsigned 32-bit seed used for all benchmark training runs",
+    )
     evaluation_seeds: list[StrictInt] = Field(
         default_factory=lambda: [42, 43, 44, 45, 46],
         min_length=1,
-        description="Fixed seed sequence used for evaluation across all budgets.",
+        description="Unique evaluation group seeds, canonicalized in ascending order.",
     )
-    evaluation_episodes: int = Field(
+    evaluation_episodes: StrictInt = Field(
         20, gt=0, description="Episodes per seed for benchmark evaluation"
     )
     deterministic: bool = Field(
@@ -126,8 +144,8 @@ class BenchmarkConfig(BaseModel):
     evaluation_split: Literal["custom", "train", "test"] = Field(
         "custom",
         description=(
-            "Evaluation distribution: arbitrary derived seeds ('custom') or the configured "
-            "generalization protocol's train/test seed partition."
+            "Evaluation reset-seed interval: full unsigned 32-bit custom domain or the "
+            "configured generalization protocol's train/test partition."
         ),
     )
 
@@ -143,11 +161,17 @@ class BenchmarkConfig(BaseModel):
     @field_validator("evaluation_seeds")
     @classmethod
     def _validate_evaluation_seeds(cls, values: list[int]) -> list[int]:
-        if any(value < 0 for value in values):
-            raise ValueError("Evaluation seeds must be non-negative integers.")
-        if len(values) != len(set(values)):
-            raise ValueError("Evaluation seeds must not contain duplicates.")
-        return values
+        return validate_seed_groups(values)
+
+    @model_validator(mode="after")
+    def _validate_split_allocation(self) -> BenchmarkConfig:
+        groups = validate_seed_groups(
+            self.evaluation_seeds,
+            split=None if self.evaluation_split == "custom" else self.evaluation_split,
+        )
+        allocate_episode_reset_seeds(groups, self.evaluation_episodes, split=self.evaluation_split)
+        self.evaluation_seeds = groups
+        return self
 
 
 class ExperimentConfig(BaseModel):
@@ -156,7 +180,9 @@ class ExperimentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field("drone_ppo", description="Unique experiment identifier")
-    seed: int = Field(42, ge=0, description="Random seed for reproducibility")
+    seed: StrictInt = Field(
+        42, ge=0, le=MAX_SEED, description="Unsigned 32-bit seed for reproducibility"
+    )
     algorithm: AlgorithmConfig = Field(default_factory=AlgorithmConfig)
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     training: Optional[TrainingConfig] = Field(default_factory=TrainingConfig)

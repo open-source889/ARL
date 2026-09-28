@@ -24,6 +24,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 from adaptive_rl.config import BenchmarkConfig, ExperimentConfig
+from adaptive_rl.seeds import (
+    CUSTOM_SEED_END,
+    MAX_SEED,
+    SEED_ALLOCATION_PROTOCOL,
+    SEED_ALLOCATION_VERSION,
+    SPLIT_INTERVALS,
+    allocate_episode_reset_seeds,
+    validate_seed,
+    validate_seed_groups,
+)
+
+BENCHMARK_VERSION = 1
 
 if TYPE_CHECKING:
     from adaptive_rl.evaluation.statistics import DescriptiveMetrics
@@ -282,6 +294,7 @@ class LearningCurvePoint:
     device: str = "unknown"
     per_seed_summaries: list[dict[str, int | float | None]] = field(default_factory=list)
     cross_seed_statistics: dict[str, dict[str, float | int | None]] = field(default_factory=dict)
+    episode_records: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def evaluation_group_seeds(self) -> list[int]:
@@ -328,6 +341,7 @@ class LearningCurvePoint:
             "evaluation_split": self.evaluation_split,
             "environment_fingerprint": self.environment_fingerprint,
             "device": self.device,
+            "backend": f"pytorch:{self.device}",
         }
 
 
@@ -336,8 +350,9 @@ class LearningCurveBenchmarkResult:
     """Top-level container for the ordered learning-curve benchmark output.
 
     ``status`` makes partial execution explicit: ``"completed"`` means every
-    requested budget trained and evaluated, while ``"failed"`` means the run
-    stopped at ``failed_budget`` after ``completed_budgets`` finished.
+    requested budget trained and evaluated and JSON/CSV export completed;
+    ``"failed"`` means a budget failed or artifact export did not complete.
+    ``failed_budget`` is only set when a budget itself failed.
     ``completed_budgets``, ``failed_budget``, and ``error`` (a sanitized
     ``TypeName: message`` string, never a traceback) are always serialized so
     artifact consumers can tell a partial benchmark from a complete one.
@@ -380,6 +395,7 @@ class LearningCurveBenchmarkResult:
             "error": self.error,
             "benchmark": {
                 "name": self.benchmark_name,
+                "version": BENCHMARK_VERSION,
                 "algorithm": self.algorithm,
                 "environment": self.environment,
                 "training_seed": self.training_seed,
@@ -419,16 +435,40 @@ class LearningCurveBenchmarkResult:
                     "serialization, metadata writing, evaluation, and artifact export"
                 ),
                 "episode_reset_seed_mapping": (
-                    "custom: injective Cantor pairing "
-                    "((group_seed + episode_index) * (group_seed + episode_index + 1)) // 2 "
-                    "+ episode_index; configured train/test split: SHA-256 mapping reduced "
-                    "into the finite split interval (sampling with replacement is possible)"
+                    "sorted-group-fixed-block-v1: sort unique group seeds; divide the selected "
+                    "seed interval into floor(capacity / group_count) contiguous blocks; assign "
+                    "each group its block and use episode_index as its offset; block width "
+                    "depends on group count, not episode count"
+                ),
+                "independence_assumption": (
+                    "one evaluation group is one Student-t observation; reset-seed blocks are "
+                    "disjoint across groups and episodes are not treated as independent samples"
+                ),
+                "confidence_interval": (
+                    "two-sided 95% Student's t interval using sample standard deviation across "
+                    "one summary per independently sampled evaluation group; groups have "
+                    "disjoint reset-seed blocks; unavailable with fewer than two non-missing "
+                    "group summaries"
                 ),
             },
             "provenance": {
                 **self.provenance,
                 "environment_configuration": self.environment_configuration,
                 "environment_fingerprint_sha256": self.environment_fingerprint,
+                "seed_allocation": {
+                    "protocol": SEED_ALLOCATION_PROTOCOL,
+                    "version": SEED_ALLOCATION_VERSION,
+                    "list_dependent": True,
+                    "group_order": "ascending evaluation group seed",
+                    "seed_domain": [0, MAX_SEED],
+                    "split": self.evaluation_split,
+                    "capacity": (
+                        CUSTOM_SEED_END
+                        if self.evaluation_split == "custom"
+                        else SPLIT_INTERVALS[self.evaluation_split][1]
+                        - SPLIT_INTERVALS[self.evaluation_split][0]
+                    ),
+                },
             },
             "results": [
                 {
@@ -451,9 +491,11 @@ class LearningCurveBenchmarkResult:
                     "environment": point.environment,
                     "environment_fingerprint": point.environment_fingerprint,
                     "device": point.device,
+                    "backend": f"pytorch:{point.device}",
                     "descriptive_metrics": point.descriptive_metrics,
                     "per_seed_summaries": point.per_seed_summaries,
                     "cross_seed_statistics": point.cross_seed_statistics,
+                    "episode_records": point.episode_records,
                     "training_metadata": point.training_metadata,
                 }
                 for point in self.points
@@ -522,6 +564,7 @@ def _evaluate_model(
     DescriptiveMetrics,
     list[dict[str, Any]],
     dict[str, dict[str, float | int | None]],
+    list[dict[str, Any]],
 ]:
     """Evaluate one trained model under fixed evaluation conditions.
 
@@ -553,6 +596,7 @@ def _evaluate_model(
             descriptive,
             [summary.to_dict() for summary in evaluation.per_seed],
             {name: stats.to_dict() for name, stats in evaluation.aggregate.items()},
+            [record.to_dict() for record in evaluation.episodes],
         )
     finally:
         env.close()
@@ -616,7 +660,7 @@ def _run_single_budget(
         evaluation_env_kwargs.pop("split", None)
     else:
         evaluation_env_kwargs["split"] = evaluation_split
-    descriptive, per_seed_summaries, cross_seed_statistics = _evaluate_model(
+    descriptive, per_seed_summaries, cross_seed_statistics, episode_records = _evaluate_model(
         model_path,
         env_name=config_copy.environment.name,
         env_kwargs=evaluation_env_kwargs,
@@ -648,6 +692,7 @@ def _run_single_budget(
         device=device,
         per_seed_summaries=per_seed_summaries,
         cross_seed_statistics=cross_seed_statistics,
+        episode_records=episode_records,
     )
 
 
@@ -718,8 +763,8 @@ def run_learning_curve_benchmark(
 
     Each budget trains a fresh PPO model from the same base configuration and
     a fixed training seed, then is evaluated under identical conditions
-    (same evaluation seed groups, episodes per seed, deterministic setting,
-    and environment configuration). Only the training budget changes.
+    (same sorted evaluation group seeds, episodes per group, deterministic
+    setting, and environment configuration). Only the training budget changes.
 
     ``training_time_seconds`` on each point measures PPO optimization only
     (see :class:`~adaptive_rl.training.trainer.TrainingResult`).
@@ -727,9 +772,10 @@ def run_learning_curve_benchmark(
     If a budget fails, the JSON/CSV artifacts are still written with
     ``status="failed"``, ``completed_budgets``, ``failed_budget``, and a
     sanitized ``error`` message, and :class:`BenchmarkRunError` is raised with
-    the partial result attached. Plotting happens only after JSON/CSV are on
-    disk, so a plot failure cannot corrupt benchmark data; the failure is
-    recorded in ``plot_error`` and the result is still returned.
+    the partial result attached. An incomplete artifact export also leaves a
+    failed JSON manifest rather than a false completed status. Plotting happens
+    only after JSON/CSV are on disk, so a plot failure cannot corrupt benchmark
+    data; the failure is recorded in ``plot_error`` and the result is returned.
     """
     algorithm_name = str(config.algorithm.name).strip().lower()
     if algorithm_name != "ppo":
@@ -745,13 +791,26 @@ def run_learning_curve_benchmark(
 
     benchmark_cfg = _resolve_benchmark_config(config, None)
     normalized = validate_budgets(benchmark_cfg.budgets if budgets is None else budgets)
-    final_evaluation_split = (
+    raw_evaluation_split = (
         benchmark_cfg.evaluation_split if evaluation_split is None else evaluation_split
     )
+    if not isinstance(raw_evaluation_split, str):
+        raise ValueError("evaluation_split must be one of 'custom', 'train', or 'test'.")
+    final_evaluation_split = raw_evaluation_split.strip().lower()
     if final_evaluation_split not in ("custom", "train", "test"):
         raise ValueError("evaluation_split must be one of 'custom', 'train', or 'test'.")
 
     training_split = config.environment.parameters.get("split")
+    if training_split is not None:
+        if not isinstance(training_split, str) or training_split.strip().lower() not in (
+            "train",
+            "test",
+        ):
+            raise ValueError(
+                "environment.parameters.split must be 'train' or 'test'; "
+                "policy training cannot use an unknown partition."
+            )
+        training_split = training_split.strip().lower()
     if training_split == "test":
         raise ValueError(
             "The training environment cannot use the held-out 'test' split. "
@@ -774,31 +833,23 @@ def run_learning_curve_benchmark(
         list(benchmark_cfg.evaluation_seeds) if evaluation_seeds is None else list(evaluation_seeds)
     )
 
-    if isinstance(final_training_seed, bool) or not isinstance(final_training_seed, int):
-        raise ValueError("Training seed must be an integer.")
-    if final_training_seed < 0:
-        raise ValueError("Training seed must be non-negative.")
-    if not final_eval_seeds:
-        raise ValueError("Evaluation seeds must not be empty.")
-    if any(isinstance(seed, bool) or not isinstance(seed, int) for seed in final_eval_seeds):
-        raise ValueError("Evaluation seeds must be integers.")
-    if any(seed < 0 for seed in final_eval_seeds):
-        raise ValueError("Evaluation seeds must be non-negative.")
-    if len(set(final_eval_seeds)) != len(final_eval_seeds):
-        raise ValueError("Evaluation seeds must not contain duplicates.")
-    if final_evaluation_split in ("train", "test"):
-        from adaptive_rl.evaluation.generalization import validate_split_seed
-
-        for seed in final_eval_seeds:
-            validate_split_seed(seed, final_evaluation_split)
+    final_training_seed = validate_seed(final_training_seed, label="Training seed")
+    final_eval_seeds = validate_seed_groups(
+        final_eval_seeds,
+        split=None if final_evaluation_split == "custom" else final_evaluation_split,
+    )
 
     final_eval_episodes = (
         benchmark_cfg.evaluation_episodes if evaluation_episodes is None else evaluation_episodes
     )
     if isinstance(final_eval_episodes, bool) or not isinstance(final_eval_episodes, int):
-        raise ValueError("Evaluation episodes per seed must be an integer.")
+        raise ValueError("Evaluation episodes per seed must be a positive integer.")
     if final_eval_episodes <= 0:
-        raise ValueError("Evaluation episodes per seed must be positive.")
+        raise ValueError("Evaluation episodes per seed must be a positive integer.")
+    # Validate the complete seed assignment before making directories, environments, or models.
+    allocate_episode_reset_seeds(
+        final_eval_seeds, final_eval_episodes, split=final_evaluation_split
+    )
 
     if deterministic is None:
         if config.benchmark is not None:
@@ -881,10 +932,30 @@ def run_learning_curve_benchmark(
         ),
     )
 
-    # Artifacts are written before any plotting so a rendering failure can
-    # never corrupt or truncate valid JSON/CSV benchmark data.
+    # Publish a non-complete manifest before replacing CSV, then make the
+    # completed/partial status visible only after both tabular artifacts exist.
+    training_status = result.status
+    training_error = result.error
+    if training_status == "completed":
+        result.status = "failed"
+        result.error = "ArtifactExportError: benchmark artifact export is incomplete."
     _write_json(result)
-    _write_csv(result)
+    try:
+        _write_csv(result)
+    except Exception as exc:
+        result.status = "failed"
+        csv_error = f"{type(exc).__name__}: {exc}"
+        result.error = (
+            f"{training_error}; artifact export failed: {csv_error}"
+            if training_error is not None
+            else f"Artifact export failed: {csv_error}"
+        )
+        _write_json(result)
+        raise RuntimeError(f"Benchmark CSV export failed: {csv_error}") from exc
+
+    result.status = training_status
+    result.error = training_error
+    _write_json(result)
 
     if status == "failed":
         raise BenchmarkRunError(f"Benchmark failed at budget {failed_budget}: {error}", result)

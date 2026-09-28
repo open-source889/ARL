@@ -14,16 +14,17 @@ from adaptive_rl.environments.drone import DroneNavigation3DEnv, ObstacleSphere3
 from adaptive_rl.evaluation.evaluator import (
     Evaluator,
     compare_policies,
-    derive_episode_reset_seed,
     evaluate_random_policy,
     run_obstacle_density_experiment,
 )
 from adaptive_rl.evaluation.metrics import compute_trajectory_metrics
 from adaptive_rl.evaluation.statistics import (
+    _student_t_cdf,
     student_t_critical_value,
     summarize_descriptive_episodes,
     summarize_seed_values,
 )
+from adaptive_rl.seeds import allocate_episode_reset_seeds
 
 
 class _SeedOutcomeEnv(gym.Env):
@@ -130,6 +131,8 @@ def test_evaluator_episode_records() -> None:
 
 
 def test_student_t_statistics_match_analytical_values() -> None:
+    # Reference quantiles were generated with scipy.stats.t.ppf; scipy is not
+    # a runtime or test dependency.
     assert student_t_critical_value(0.95, 1) == pytest.approx(12.7062047364, rel=1e-9)
     assert student_t_critical_value(0.95, 2) == pytest.approx(4.3026527297, rel=1e-9)
     assert student_t_critical_value(0.95, 5) == pytest.approx(2.5705818356, rel=1e-9)
@@ -149,6 +152,21 @@ def test_student_t_statistics_match_analytical_values() -> None:
     assert stats.ci95_lower == pytest.approx(2.0 - margin)
     assert stats.ci95_upper == pytest.approx(2.0 + margin)
     assert stats.sample_count == 3
+
+
+def test_student_t_cdf_symmetry_monotonicity_and_numerical_edges() -> None:
+    values = (-1e6, -10.0, -1.0, 0.0, 1.0, 10.0, 1e6)
+    cdf_values = [_student_t_cdf(value, 7) for value in values]
+    assert cdf_values == sorted(cdf_values)
+    assert _student_t_cdf(0.0, 7) == 0.5
+    for value in (0.25, 1.0, 4.0, 1e6):
+        assert _student_t_cdf(-value, 7) == pytest.approx(1.0 - _student_t_cdf(value, 7), abs=1e-14)
+    assert math.isfinite(student_t_critical_value(0.90, 5))
+    assert math.isfinite(student_t_critical_value(0.999, 30))
+
+    for value, degrees in ((True, 5), (float("nan"), 5), (1.0, True), (1.0, 0)):
+        with pytest.raises(ValueError):
+            _student_t_cdf(value, degrees)  # type: ignore[arg-type]
 
 
 def test_student_t_statistics_handle_small_and_constant_samples() -> None:
@@ -171,6 +189,9 @@ def test_student_t_statistics_handle_small_and_constant_samples() -> None:
     assert constant.ci95_upper == 3.0
 
     assert summarize_seed_values([None, None]).mean is None
+    with_missing = summarize_seed_values([1.0, None, 3.0])
+    assert with_missing.sample_count == 2
+    assert with_missing.mean == 2.0
     with pytest.raises(ValueError, match="finite"):
         summarize_seed_values([1.0, float("nan")])
 
@@ -190,18 +211,27 @@ def test_evaluate_seeds_preserves_per_seed_records_and_metrics(tmp_path: Path) -
         (20, 0),
         (20, 1),
     ]
-    assert [record.episode_seed for record in result.episodes] == [55, 67, 210, 232]
+    expected_reset_seeds = allocate_episode_reset_seeds([10, 20], 2, split="custom")
+    assert [record.episode_seed for record in result.episodes] == [
+        *expected_reset_seeds[10],
+        *expected_reset_seeds[20],
+    ]
     assert all(record.path_length == 1.0 for record in result.episodes)
     assert [summary.seed for summary in result.per_seed] == requested_seeds
     assert [summary.episodes for summary in result.per_seed] == [2, 2]
-    assert [summary.mean_reward for summary in result.per_seed] == [61.0, 221.0]
-    assert result.per_seed[0].success_rate == pytest.approx(0.0)
-    assert result.per_seed[0].collision_rate == pytest.approx(1.0)
+    expected_seed_means = [
+        math.fsum(float(seed) for seed in expected_reset_seeds[group]) / 2 for group in (10, 20)
+    ]
+    assert [summary.mean_reward for summary in result.per_seed] == expected_seed_means
+    assert result.per_seed[0].success_rate == pytest.approx(0.5)
+    assert result.per_seed[0].collision_rate == pytest.approx(0.5)
     assert result.per_seed[0].truncation_rate == pytest.approx(0.0)
     assert result.per_seed[0].mean_episode_length == 1.0
     assert result.per_seed[0].path_length == 1.0
-    assert result.aggregate["mean_reward"].mean == pytest.approx(141.0)
-    assert result.aggregate["mean_reward"].std == pytest.approx(math.sqrt(12800.0))
+    assert result.aggregate["mean_reward"].mean == pytest.approx(math.fsum(expected_seed_means) / 2)
+    assert result.aggregate["mean_reward"].std == pytest.approx(
+        summarize_seed_values(expected_seed_means).std
+    )
 
     json_path = tmp_path / "evaluation_multiseed.json"
     csv_path = tmp_path / "evaluation_multiseed.csv"
@@ -210,35 +240,26 @@ def test_evaluate_seeds_preserves_per_seed_records_and_metrics(tmp_path: Path) -
     assert saved_csv.is_file()
     document = json.loads(saved_json.read_text(encoding="utf-8"))
     json.dumps(document, allow_nan=False)
-    assert document["metadata"] == {
-        "seeds": [10, 20],
-        "evaluation_group_seeds": [10, 20],
-        "seed_count": 2,
-        "seed_semantics": (
-            "seeds are evaluation group seeds (the statistical grouping unit); "
-            "episodes within a group use derived episode_reset_seed values"
-        ),
-        "episode_reset_seed_mapping": (
-            "custom: Cantor pairing ((group_seed + episode_index) * "
-            "(group_seed + episode_index + 1)) // 2 + episode_index; "
-            "configured split: SHA-256 of "
-            "'adaptive-rl-evaluation-reset-v1:<split>:<group_seed>:<episode_index>' "
-            "reduced into the finite split interval"
-        ),
-        "episodes_per_seed": 2,
-        "total_episodes": 4,
-        "deterministic": True,
-        "environment": "drone",
-        "confidence_interval": (
-            "two-sided 95% Student's t interval across seed summaries; "
-            "sample standard deviation; unavailable when fewer than two values exist"
-        ),
-        "duplicate_seed_policy": "rejected",
+    assert document["metadata"]["seeds"] == [10, 20]
+    assert document["metadata"]["evaluation_group_seeds"] == [10, 20]
+    assert document["metadata"]["seed_count"] == 2
+    assert document["metadata"]["evaluation_split"] == "custom"
+    assert document["metadata"]["seed_allocation"] == {
+        "protocol": "sorted-group-fixed-block",
+        "version": 1,
+        "list_dependent": True,
     }
+    assert "one evaluation group" in document["metadata"]["independence_assumption"]
+    assert document["metadata"]["episodes_per_seed"] == 2
+    assert document["metadata"]["total_episodes"] == 4
+    assert document["metadata"]["deterministic"] is True
+    assert document["metadata"]["environment"] == "drone"
+    assert "Student's t" in document["metadata"]["confidence_interval"]
+    assert document["metadata"]["duplicate_seed_policy"] == "rejected"
     assert len(document["episodes"]) == 4
     assert len(document["per_seed"]) == 2
     assert document["aggregate"]["mean_reward"]["sample_count"] == 2
-    assert document["episodes"][0]["episode_seed"] == 55
+    assert document["episodes"][0]["episode_seed"] == expected_reset_seeds[10][0]
     assert document["episodes"][0]["path_length"] == 1.0
 
     expected_headers = [
@@ -258,7 +279,7 @@ def test_evaluate_seeds_preserves_per_seed_records_and_metrics(tmp_path: Path) -
         assert reader.fieldnames == expected_headers
     assert len(rows) == len(result.aggregate)
     assert rows[0]["metric"] == "mean_reward"
-    assert float(rows[0]["mean"]) == pytest.approx(141.0)
+    assert float(rows[0]["mean"]) == pytest.approx(math.fsum(expected_seed_means) / 2)
     assert rows[0]["seed_count"] == "2"
     assert rows[0]["episodes_per_seed"] == "2"
     assert rows[0]["total_episodes"] == "4"
@@ -278,7 +299,7 @@ def test_evaluate_seeds_is_deterministic_and_rejects_invalid_inputs() -> None:
         evaluator.evaluate_seeds([7, 7], episodes_per_seed=1)
     with pytest.raises(ValueError, match="positive"):
         evaluator.evaluate_seeds([7], episodes_per_seed=0)
-    with pytest.raises(ValueError, match="non-negative"):
+    with pytest.raises(ValueError, match=r"\[0, 4294967295\]"):
         evaluator.evaluate_seeds([-1], episodes_per_seed=1)
     evaluator.close()
 
@@ -302,14 +323,15 @@ def test_evaluation_group_reset_seeds_are_independent_of_episode_count() -> None
             for index, group_seed in enumerate((11, 13))
         }
 
+        expected = allocate_episode_reset_seeds([11, 13], episodes_per_seed, split="custom")[11]
         group_11_records = {
             record.episode_index: record
             for record in result.episodes
             if record.evaluation_group_seed == 11
         }
-        assert group_11_records[0].episode_reset_seed == derive_episode_reset_seed(11, 0)
+        assert group_11_records[0].episode_reset_seed == expected[0]
         if episodes_per_seed > 1:
-            assert group_11_records[1].episode_reset_seed == derive_episode_reset_seed(11, 1)
+            assert group_11_records[1].episode_reset_seed == expected[1]
         assert len(result.episodes) == 2 * episodes_per_seed
         evaluator.close()
 
@@ -320,21 +342,16 @@ def test_evaluation_group_reset_seeds_are_independent_of_episode_count() -> None
                 observed[episode_count][group_seed][: min(episode_count, 5)]
                 == reference[: min(episode_count, 5)]
             )
-    assert observed[1][11][0] == observed[5][11][0] == observed[20][11][0] == 66
-    assert observed[1][13][0] == observed[5][13][0] == observed[20][13][0]
-    assert observed[5][11][1] == observed[20][11][1] == observed[100][11][1] == 79
-
-    seeds_group_11 = {derive_episode_reset_seed(11, index) for index in range(100)}
-    seeds_group_13 = {derive_episode_reset_seed(13, index) for index in range(100)}
-    assert seeds_group_11.isdisjoint(seeds_group_13)
+    assert set(observed[100][11]).isdisjoint(observed[100][13])
 
 
 def test_split_seed_mapping_is_stable_and_respects_partition() -> None:
-    train_seed = derive_episode_reset_seed(11, 3, split="train")
-    test_seed = derive_episode_reset_seed(1001, 3, split="test")
-    assert train_seed == derive_episode_reset_seed(11, 3, split="train")
-    assert 0 <= train_seed < 1000
-    assert 1000 <= test_seed < 1200
+    train_seeds = allocate_episode_reset_seeds([11, 12], 4, split="train")
+    test_seeds = allocate_episode_reset_seeds([1001, 1002], 4, split="test")
+    assert 0 <= train_seeds[11][3] < 1000
+    assert 1000 <= test_seeds[1001][3] < 1200
+    assert len(set(train_seeds[11] + train_seeds[12])) == 8
+    assert len(set(test_seeds[1001] + test_seeds[1002])) == 8
 
 
 def test_evaluate_seeds_preserves_unavailable_optional_metrics() -> None:
@@ -1036,17 +1053,24 @@ def test_episode_records_expose_group_and_reset_seed_naming(tmp_path: Path) -> N
     records = result.episodes
 
     assert [record.evaluation_group_seed for record in records] == [10, 10, 20, 20]
-    assert [record.episode_reset_seed for record in records] == [55, 67, 210, 232]
+    expected_reset_seeds = allocate_episode_reset_seeds([10, 20], 2)
+    assert [record.episode_reset_seed for record in records] == [
+        *expected_reset_seeds[10],
+        *expected_reset_seeds[20],
+    ]
     # Legacy names keep their documented meanings: seed is the group seed and
     # episode_seed is the per-episode reset seed.
     assert [record.seed for record in records] == [10, 10, 20, 20]
-    assert [record.episode_seed for record in records] == [55, 67, 210, 232]
+    assert [record.episode_seed for record in records] == [
+        *expected_reset_seeds[10],
+        *expected_reset_seeds[20],
+    ]
 
     payload = records[0].to_dict()
     assert payload["evaluation_group_seed"] == 10
-    assert payload["episode_reset_seed"] == 55
+    assert payload["episode_reset_seed"] == expected_reset_seeds[10][0]
     assert payload["seed"] == 10
-    assert payload["episode_seed"] == 55
+    assert payload["episode_seed"] == expected_reset_seeds[10][0]
 
     assert [summary.evaluation_group_seed for summary in result.per_seed] == [10, 20]
     assert [summary.seed for summary in result.per_seed] == [10, 20]
@@ -1063,7 +1087,7 @@ def test_episode_records_expose_group_and_reset_seed_naming(tmp_path: Path) -> N
     exported = json.loads(saved_json.read_text(encoding="utf-8"))
     json.dumps(exported, allow_nan=False)
     assert exported["episodes"][0]["evaluation_group_seed"] == 10
-    assert exported["episodes"][0]["episode_reset_seed"] == 55
+    assert exported["episodes"][0]["episode_reset_seed"] == expected_reset_seeds[10][0]
     assert saved_csv.is_file()
     evaluator.close()
 
@@ -1133,4 +1157,141 @@ def test_evaluator_reads_obstacle_geometry_from_public_interface(
     evaluator = Evaluator(algorithm=_ZeroDronePolicy(), env=env)  # type: ignore[arg-type]
     result = evaluator.evaluate_seeds([5], episodes_per_seed=1)
     assert result.episodes[0].min_obstacle_clearance is not None
+    evaluator.close()
+
+
+@pytest.mark.parametrize(
+    ("split", "groups", "episodes_per_group"),
+    [
+        ("train", list(range(100, 120)), 20),
+        ("test", list(range(1000, 1020)), 8),
+    ],
+)
+def test_split_allocation_has_unique_round_trippable_reset_seeds(
+    split: str, groups: list[int], episodes_per_group: int
+) -> None:
+    evaluator = Evaluator(algorithm=_ZeroPolicy(), env=_SeedOutcomeEnv())  # type: ignore[arg-type]
+    result = evaluator.evaluate_seeds(
+        list(reversed(groups)), episodes_per_seed=episodes_per_group, split=split
+    )
+
+    records = [record.to_dict() for record in result.episodes]
+    reset_seeds = [record["episode_reset_seed"] for record in records]
+    assert result.seeds == sorted(groups)
+    assert len(reset_seeds) == len(set(reset_seeds))
+    assert [(record["evaluation_group_seed"], record["episode_index"]) for record in records] == [
+        (group, episode_index)
+        for group in sorted(groups)
+        for episode_index in range(episodes_per_group)
+    ]
+    assert all(
+        groups_start <= record["episode_reset_seed"] < groups_end
+        for record in records
+        for groups_start, groups_end in (((0, 1000) if split == "train" else (1000, 1200),))
+    )
+    assert len(
+        {(record["evaluation_group_seed"], record["episode_index"]) for record in records}
+    ) == len(records)
+    evaluator.close()
+
+
+def test_custom_reset_seed_is_stable_when_episode_count_changes() -> None:
+    observed: dict[int, dict[tuple[int, int], int]] = {}
+    for episode_count in (2, 5, 20):
+        evaluator = Evaluator(algorithm=_ZeroPolicy(), env=_SeedOutcomeEnv())  # type: ignore[arg-type]
+        result = evaluator.evaluate_seeds([12, 11], episodes_per_seed=episode_count)
+        assert result.seeds == [11, 12]
+        observed[episode_count] = {
+            (record.evaluation_group_seed, record.episode_index): record.episode_reset_seed
+            for record in result.episodes
+            if record.episode_index < 2
+        }
+        evaluator.close()
+
+    assert observed[2] == observed[5] == observed[20]
+
+
+@pytest.mark.parametrize("seed", [-1, 2**32, True])
+def test_evaluator_rejects_seeds_outside_gymnasium_seed_domain(
+    seed: int | bool,
+) -> None:
+    env = _SeedOutcomeEnv()
+    reset_seeds: list[int | None] = []
+    original_reset = env.reset
+
+    def record_reset(*, seed: int | None = None, options: dict | None = None):
+        reset_seeds.append(seed)
+        return original_reset(seed=seed, options=options)
+
+    env.reset = record_reset  # type: ignore[method-assign]
+    evaluator = Evaluator(algorithm=_ZeroPolicy(), env=env)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match=r"\[0, 4294967295\]"):
+        evaluator.evaluate_seeds([seed], episodes_per_seed=1)  # type: ignore[list-item]
+    assert reset_seeds == []
+    evaluator.close()
+
+
+def test_evaluator_accepts_seed_domain_endpoints() -> None:
+    for seed in (0, 2**32 - 1):
+        evaluator = Evaluator(algorithm=_ZeroPolicy(), env=_SeedOutcomeEnv())  # type: ignore[arg-type]
+        result = evaluator.evaluate_seeds([seed], episodes_per_seed=1)
+        assert result.seeds == [seed]
+        assert 0 <= result.episodes[0].episode_reset_seed <= 2**32 - 1
+        evaluator.close()
+
+
+def test_evaluator_does_not_compute_confidence_intervals_for_overlapping_allocations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import adaptive_rl.evaluation.evaluator as evaluator_module
+
+    env = _SeedOutcomeEnv()
+    reset_seeds: list[int | None] = []
+    original_reset = env.reset
+
+    def record_reset(*, seed: int | None = None, options: dict | None = None):
+        reset_seeds.append(seed)
+        return original_reset(seed=seed, options=options)
+
+    env.reset = record_reset  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        evaluator_module,
+        "allocate_episode_reset_seeds",
+        lambda groups, count, *, split: {group: [7] for group in groups},
+    )
+    evaluator = Evaluator(algorithm=_ZeroPolicy(), env=env)  # type: ignore[arg-type]
+    with pytest.raises(RuntimeError, match="overlapping group reset seeds"):
+        evaluator.evaluate_seeds([11, 12], episodes_per_seed=1)
+    assert reset_seeds == []
+    evaluator.close()
+
+
+def test_evaluator_rejects_base_seed_range_overflow_before_reset() -> None:
+    env = _SeedOutcomeEnv()
+    reset_seeds: list[int | None] = []
+    original_reset = env.reset
+
+    def record_reset(*, seed: int | None = None, options: dict | None = None):
+        reset_seeds.append(seed)
+        return original_reset(seed=seed, options=options)
+
+    env.reset = record_reset  # type: ignore[method-assign]
+    evaluator = Evaluator(algorithm=_ZeroPolicy(), env=env)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="Last episode seed"):
+        evaluator.evaluate(num_episodes=2, base_seed=2**32 - 1)
+    assert reset_seeds == []
+    evaluator.close()
+
+
+def test_serialized_multi_seed_result_revalidates_reset_seed_independence() -> None:
+    from dataclasses import replace
+
+    evaluator = Evaluator(algorithm=_ZeroPolicy(), env=_SeedOutcomeEnv())  # type: ignore[arg-type]
+    result = evaluator.evaluate_seeds([11, 12], episodes_per_seed=1)
+    result.episodes[1] = replace(
+        result.episodes[1], episode_seed=result.episodes[0].episode_reset_seed
+    )
+
+    with pytest.raises(ValueError, match="does not match the declared seed allocation"):
+        result.to_dict()
     evaluator.close()

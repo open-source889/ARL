@@ -217,6 +217,50 @@ benchmark:
     assert configured.benchmark.evaluation_split == "custom"
 
 
+def test_seed_config_enforces_unsigned_32_bit_domain_and_split_membership() -> None:
+    assert ExperimentConfig(seed=0).seed == 0
+    assert ExperimentConfig(seed=2**32 - 1).seed == 2**32 - 1
+    for invalid_seed in (-1, 2**32, True):
+        with pytest.raises(ValidationError):
+            ExperimentConfig(seed=invalid_seed)
+
+    assert BenchmarkConfig(training_seed=2**32 - 1).training_seed == 2**32 - 1
+    assert AlgorithmConfig(parameters={"seed": 2**32 - 1}).parameters["seed"] == 2**32 - 1
+    for invalid_seed in (2**32, -1, True):
+        with pytest.raises(ValidationError):
+            AlgorithmConfig(parameters={"seed": invalid_seed})
+    for values in (
+        {"training_seed": -1},
+        {"training_seed": 2**32},
+        {"training_seed": True},
+        {"evaluation_seeds": [-1]},
+        {"evaluation_seeds": [2**32]},
+        {"evaluation_seeds": [True]},
+        {"evaluation_episodes": True},
+        {"evaluation_split": "test"},
+    ):
+        with pytest.raises(ValidationError):
+            BenchmarkConfig(**values)
+
+    held_out = BenchmarkConfig(
+        evaluation_split="test", evaluation_seeds=[1000, 1199], evaluation_episodes=100
+    )
+    assert held_out.evaluation_seeds == [1000, 1199]
+
+
+def test_custom_split_block_assignment_is_list_dependent_but_episode_stable() -> None:
+    from adaptive_rl.seeds import allocate_episode_reset_seeds
+
+    small = allocate_episode_reset_seeds([12, 11], 2, split="custom")
+    extended = allocate_episode_reset_seeds([11, 12], 20, split="custom")
+    changed_groups = allocate_episode_reset_seeds([10, 11, 12], 2, split="custom")
+
+    assert small[11] == extended[11][:2]
+    assert small[12] == extended[12][:2]
+    assert small[11] != changed_groups[11]
+    assert all(0 <= seed < 2**32 for seeds in extended.values() for seed in seeds)
+
+
 def test_core_and_benchmark_imports_do_not_load_optional_rl_stack() -> None:
     """Importing the core package or benchmarking must not need torch/sb3/gym."""
     repository_root = Path(__file__).resolve().parent.parent
@@ -268,6 +312,7 @@ def test_learning_curve_benchmark_execution_and_exports(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from adaptive_rl.benchmarking import learning_curve
+    from adaptive_rl.seeds import allocate_episode_reset_seeds
     from adaptive_rl.training.trainer import PPOTrainer
 
     config = _make_config(tmp_path)
@@ -347,6 +392,12 @@ def test_learning_curve_benchmark_execution_and_exports(
         assert call["env_name"] == config.environment.name
         assert call["env_kwargs"] == config.environment.parameters
     assert len(evaluation_calls) == 2
+    assert [point.training_seed for point in result.points] == [17, 17]
+    assert [point.evaluation_group_seeds for point in result.points] == [[11, 12], [11, 12]]
+    assert [point.episodes_per_seed for point in result.points] == [1, 1]
+    assert [point.deterministic for point in result.points] == [True, True]
+    assert [point.evaluation_split for point in result.points] == ["custom", "custom"]
+    assert len({point.environment_fingerprint for point in result.points}) == 1
 
     model_paths = [Path(point.model_path) for point in result.points]
     assert len(set(model_paths)) == 2
@@ -390,6 +441,9 @@ def test_learning_curve_benchmark_execution_and_exports(
     assert data["benchmark"]["deterministic"] is True
     assert data["benchmark"]["evaluation_split"] == "custom"
     assert data["benchmark"]["budgets"] == [64, 128]
+    assert data["benchmark"]["version"] == 1
+    assert data["provenance"]["seed_allocation"]["capacity"] == 2**32
+    assert data["provenance"]["seed_allocation"]["split"] == "custom"
     assert data["provenance"]["adaptive_rl_version"]
     assert data["provenance"]["python_version"]
     assert set(data["provenance"]["packages"]) == {"torch", "stable-baselines3", "gymnasium"}
@@ -416,6 +470,8 @@ def test_learning_curve_benchmark_execution_and_exports(
         "evaluation_split",
         "environment_fingerprint",
         "device",
+        "backend",
+        "episode_records",
     }
     for row in data["results"]:
         assert required_metrics <= row.keys()
@@ -434,6 +490,28 @@ def test_learning_curve_benchmark_execution_and_exports(
         assert metadata["episodes_per_seed"] == 1
         assert metadata["model_path"] == row["model_path"]
         assert metadata["training_time_seconds"] == row["training_time_seconds"]
+        assert metadata["backend"] == f"pytorch:{row['device']}"
+        assert row["backend"] == metadata["backend"]
+        assert len(row["episode_records"]) == 2
+        assert [record["evaluation_group_seed"] for record in row["episode_records"]] == [
+            11,
+            12,
+        ]
+        assert all(
+            isinstance(record["episode_reset_seed"], int) for record in row["episode_records"]
+        )
+        allocation = allocate_episode_reset_seeds([11, 12], 1, split="custom")
+        assert [
+            (record["evaluation_group_seed"], record["episode_index"], record["episode_reset_seed"])
+            for record in row["episode_records"]
+        ] == [
+            (group_seed, episode_index, reset_seed)
+            for group_seed in (11, 12)
+            for episode_index, reset_seed in enumerate(allocation[group_seed])
+        ]
+        assert (
+            row["environment_fingerprint"] == data["provenance"]["environment_fingerprint_sha256"]
+        )
     assert set(data["plot_data"]) == {
         "budgets",
         "trained_timesteps",
@@ -545,7 +623,16 @@ def test_test_split_benchmark_records_distribution_and_seed_provenance(tmp_path:
         == "test"
     )
     episode_seed_mapping = document["benchmark"]["episode_reset_seed_mapping"]
-    assert "SHA-256" in episode_seed_mapping
+    assert "sorted-group-fixed-block-v1" in episode_seed_mapping
+    assert document["provenance"]["seed_allocation"] == {
+        "protocol": "sorted-group-fixed-block",
+        "version": 1,
+        "list_dependent": True,
+        "group_order": "ascending evaluation group seed",
+        "seed_domain": [0, 2**32 - 1],
+        "split": "test",
+        "capacity": 200,
+    }
     assert result.points[0].per_seed_summaries[0]["seed"] == 1001
     assert result.points[0].evaluation_split == "test"
 
@@ -566,6 +653,15 @@ def test_split_benchmark_requires_train_partition_for_policy_training(tmp_path: 
             evaluation_split="test",
         )
     assert not (tmp_path / "invalid_split").exists()
+
+    config.environment.parameters["split"] = "test"
+    with pytest.raises(ValueError, match="training environment cannot use the held-out 'test'"):
+        run_learning_curve_benchmark(
+            config,
+            budgets=[64],
+            output_dir=tmp_path / "test_training_partition",
+        )
+    assert not (tmp_path / "test_training_partition").exists()
 
 
 def test_benchmark_keeps_single_episode_standard_deviation_unavailable(
@@ -1222,6 +1318,7 @@ def test_benchmark_training_time_is_training_operation_time(
                     "sample_count": 1,
                 }
             },
+            [],
         )
 
     monkeypatch.setattr(learning_curve_module, "_make_env", lambda *a, **k: FakeEnv())
@@ -1345,6 +1442,44 @@ def test_first_budget_failure_still_writes_status_manifest(
     assert rows == []
 
 
+def test_csv_export_failure_leaves_failed_json_manifest_and_preserves_old_csv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import adaptive_rl.benchmarking.learning_curve as learning_curve_module
+
+    config = _make_config(tmp_path)
+    target_dir = tmp_path / "csv_export_failure"
+    target_dir.mkdir()
+    csv_path = target_dir / "learning_curve_budget.csv"
+    previous_csv = b"previous,complete,artifact\n"
+    csv_path.write_bytes(previous_csv)
+    real_replace = learning_curve_module.os.replace
+
+    def fail_csv_replace(source: str | Path, destination: str | Path) -> None:
+        if Path(destination) == csv_path:
+            raise OSError("injected CSV replacement failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(learning_curve_module.os, "replace", fail_csv_replace)
+
+    with pytest.raises(RuntimeError, match="Benchmark CSV export failed"):
+        run_learning_curve_benchmark(config, budgets=[64], output_dir=target_dir)
+
+    json_path = target_dir / "learning_curve_budget.json"
+    document = json.loads(json_path.read_text(encoding="utf-8"))
+    json.dumps(document, allow_nan=False)
+    assert document["status"] == "failed"
+    assert document["completed_budgets"] == [64]
+    assert document["failed_budget"] is None
+    assert document["error"] == (
+        "Artifact export failed: OSError: injected CSV replacement failure"
+    )
+    assert len(document["results"]) == 1
+    assert Path(document["results"][0]["model_path"]).is_file()
+    assert csv_path.read_bytes() == previous_csv
+    assert list(target_dir.glob(".learning_curve_budget.csv.*.tmp")) == []
+
+
 def test_cli_reports_partial_benchmark_failure_with_nonzero_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1436,3 +1571,164 @@ def test_plot_failure_preserves_json_and_csv_artifacts(
     with result.csv_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.DictReader(handle))
     assert len(rows) == 1
+
+
+def test_finite_split_capacity_is_checked_before_environment_or_training(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import adaptive_rl.benchmarking.learning_curve as learning_curve_module
+
+    config = _make_config(tmp_path)
+    config.environment.parameters["split"] = "train"
+    assert config.benchmark is not None
+    config.benchmark.evaluation_seeds = [1000, 1001, 1002, 1003, 1004]
+    config.benchmark.evaluation_episodes = 41
+    touched: list[str] = []
+
+    def unexpected_env(*args: Any, **kwargs: Any) -> Any:
+        touched.append("environment")
+        raise RuntimeError("environment construction must not be reached")
+
+    def unexpected_trainer(*args: Any, **kwargs: Any) -> Any:
+        touched.append("trainer")
+        raise RuntimeError("PPO construction must not be reached")
+
+    monkeypatch.setattr(learning_curve_module, "_make_env", unexpected_env)
+    monkeypatch.setattr(learning_curve_module, "_make_trainer", unexpected_trainer)
+    output_dir = tmp_path / "impossible_split"
+    with pytest.raises(
+        ValueError,
+        match=r"groups=.*episodes per group=41.*total reset seeds required=205.*"
+        r"available capacity=200.*maximum feasible episodes per group=40",
+    ):
+        run_learning_curve_benchmark(
+            config,
+            budgets=[64],
+            output_dir=output_dir,
+            evaluation_split="test",
+        )
+
+    assert touched == []
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"evaluation_split": "validation"}, "evaluation_split"),
+        ({"evaluation_seeds": [1000, 1000]}, "unique"),
+        ({"evaluation_seeds": [999]}, "test.*split"),
+        ({"evaluation_seeds": [2**32]}, r"\[0, 4294967295\]"),
+        ({"evaluation_episodes": 0}, "positive"),
+        ({"evaluation_episodes": True}, "integer"),
+    ],
+)
+def test_split_configuration_errors_are_rejected_before_environment_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict[str, Any],
+    message: str,
+) -> None:
+    import adaptive_rl.benchmarking.learning_curve as learning_curve_module
+
+    config = _make_config(tmp_path)
+    config.environment.parameters["split"] = "train"
+    assert config.benchmark is not None
+    config.benchmark.evaluation_seeds = [1000]
+    config.benchmark.evaluation_episodes = 1
+    touched = False
+
+    def unexpected_env(*args: Any, **kw: Any) -> Any:
+        nonlocal touched
+        touched = True
+        raise RuntimeError("environment construction must not be reached")
+
+    monkeypatch.setattr(learning_curve_module, "_make_env", unexpected_env)
+    options = dict(kwargs)
+    split = options.pop("evaluation_split", "test")
+    with pytest.raises(ValueError, match=message):
+        run_learning_curve_benchmark(
+            config,
+            budgets=[64],
+            output_dir=tmp_path / "invalid_split_config",
+            evaluation_split=split,
+            **options,
+        )
+    assert not touched
+
+
+def test_cli_reports_finite_split_capacity_error_without_traceback(tmp_path: Path) -> None:
+    from adaptive_rl.cli import app
+
+    config = _make_config(tmp_path)
+    config.environment.parameters["split"] = "train"
+    config_path = tmp_path / "split_capacity.yaml"
+    save_config(config, config_path)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "benchmark",
+            "budgets",
+            "--config",
+            str(config_path),
+            "--budgets",
+            "64",
+            "--eval-seeds",
+            "1000,1001",
+            "--episodes",
+            "101",
+            "--evaluation-split",
+            "test",
+            "--output-dir",
+            str(tmp_path / "cli_capacity"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    clean_output = " ".join(result.output.split())
+    assert "total reset seeds required=202" in clean_output
+    assert "available capacity=200" in clean_output
+    assert "maximum feasible episodes per group=100" in clean_output
+    assert "Traceback" not in clean_output
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["--eval-seeds", "1000,1000"], "duplicate groups"),
+        (["--eval-seeds", "4294967296"], r"\[0, 4294967295\]"),
+        (["--eval-seeds", "999"], "do not belong to the 'test' split"),
+        (["--eval-seeds", "1000", "--episodes", "0"], "positive integer"),
+        (["--evaluation-split", "validation"], "Invalid --evaluation-split"),
+    ],
+)
+def test_cli_rejects_invalid_evaluation_protocol_without_traceback(
+    tmp_path: Path, arguments: list[str], message: str
+) -> None:
+    from adaptive_rl.cli import app
+
+    config = _make_config(tmp_path)
+    config.environment.parameters["split"] = "train"
+    config_path = tmp_path / "cli_invalid_protocol.yaml"
+    save_config(config, config_path)
+    command = [
+        "benchmark",
+        "budgets",
+        "--config",
+        str(config_path),
+        "--budgets",
+        "64",
+        "--evaluation-split",
+        "test",
+        "--output-dir",
+        str(tmp_path / "cli_invalid_protocol"),
+        *arguments,
+    ]
+
+    result = CliRunner().invoke(app, command)
+
+    assert result.exit_code == 1
+    clean_output = " ".join(result.output.split())
+    assert re.search(message, clean_output)
+    assert "Traceback" not in clean_output
