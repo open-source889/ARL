@@ -537,115 +537,154 @@ def benchmark_budgets(
 
 
 @benchmark_app.command(name="adaptation")
-@app.command(name="benchmark-adaptation")
 def benchmark_adaptation(
-    seeds: Optional[str] = typer.Option(
-        None, "--seeds", help="Comma-separated training seeds (e.g. 31001,31002)"
+    config: Path = typer.Option(
+        Path("configs/drone_distribution_shift.yaml"),
+        "--config",
+        "-c",
+        help="Issue #265 nominal training and TEST-B configuration",
     ),
-    timesteps: int = typer.Option(
-        60000, "--timesteps", "-t", help="Total nominal training timesteps per replicate"
+    algorithm: Optional[str] = typer.Option(
+        None, "--algorithm", help="Algorithm cell: ppo or sac (defaults to config value)"
     ),
-    quick: bool = typer.Option(
-        False, "--quick", help="Run in fast smoke test mode (2 replicates, short budget)"
+    timesteps: Optional[int] = typer.Option(
+        None, "--timesteps", "-t", help="Smoke training budget, capped at the smoke limit"
     ),
-    output_dir: Path = typer.Option(
-        Path("artifacts/benchmarks"),
+    training_seeds: Optional[str] = typer.Option(
+        None,
+        "--seeds",
+        "--training-seeds",
+        help="Comma-separated preregistered training seeds; defaults to all ten",
+    ),
+    output_dir: Optional[Path] = typer.Option(
+        None,
         "--output",
-        "-o",
-        help="Output directory for benchmark artifacts",
+        "--output-dir",
+        help="Directory for Issue #265 JSON/CSV and training artifacts",
+    ),
+    study: Optional[str] = typer.Option(
+        None, "--study", help="Run an immutable full protocol study (prereg-v1 or prereg-v2)"
+    ),
+    run_id: Optional[str] = typer.Option(
+        None, "--run-id", help="Unique immutable output directory name required with --study"
+    ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Reuse only complete hashed replicate checkpoints for an unfinished study run",
+    ),
+    deterministic: Optional[bool] = typer.Option(
+        None,
+        "--deterministic/--stochastic",
+        help="Override evaluation action selection; PPO adaptation requires stochastic actions",
+    ),
+    smoke: bool = typer.Option(
+        False,
+        "--quick",
+        "--smoke",
+        help="Run one explicitly labeled, reduced-size machinery check (not research data)",
     ),
 ) -> None:
-    """Run the preregistered online adaptation benchmark (Adaptive vs Fixed policy)."""
-    from adaptive_rl.experiments.shift_runner import AdaptiveShiftRunner
-    from adaptive_rl.protocol.constants import TRAINING_SEEDS
+    """Run the preregistered train-once, forked Adaptive-vs-Fixed experiment."""
+    try:
+        exp_config = load_config(config)
+        if algorithm is not None:
+            selected_algorithm = algorithm.strip().lower()
+            if selected_algorithm not in {"ppo", "sac"}:
+                raise ValueError("--algorithm must be 'ppo' or 'sac'")
+            algorithm_config = exp_config.algorithm.model_copy(deep=True)
+            if selected_algorithm != algorithm_config.name.strip().lower():
+                algorithm_config.name = selected_algorithm
+                if selected_algorithm == "sac":
+                    algorithm_config.parameters = {
+                        "buffer_size": 100_000,
+                        "learning_starts": 100,
+                        "train_freq": 1,
+                        "gradient_steps": 1,
+                        "tau": 0.005,
+                        "ent_coef": "auto",
+                    }
+                else:
+                    algorithm_config.parameters = {
+                        "n_steps": 1024,
+                        "n_epochs": 10,
+                        "clip_range": 0.2,
+                        "ent_coef": 0.01,
+                    }
+                exp_config = exp_config.model_copy(
+                    update={"algorithm": algorithm_config}, deep=True
+                )
+        if deterministic is not None:
+            evaluation_config = exp_config.evaluation.model_copy(deep=True)
+            evaluation_config.deterministic = deterministic
+            exp_config = exp_config.model_copy(update={"evaluation": evaluation_config}, deep=True)
 
-    training_seed_list: List[int]
-    if seeds is not None:
-        training_seed_list = [int(s.strip()) for s in seeds.split(",") if s.strip()]
-    elif quick:
-        training_seed_list = [31001, 31002]
-    else:
-        training_seed_list = list(TRAINING_SEEDS)
+        if timesteps is not None:
+            if timesteps <= 0:
+                raise ValueError("--timesteps must be positive")
+            if not smoke:
+                raise ValueError("--timesteps is available only with --quick/--smoke")
+            if exp_config.training is None:
+                raise ValueError("--timesteps requires a training configuration")
+            exp_config.training.total_timesteps = timesteps
 
+        selected_seeds = None
+        if training_seeds is not None:
+            tokens = [token.strip() for token in training_seeds.split(",")]
+            if not tokens or any(not token for token in tokens):
+                raise ValueError("--training-seeds expects comma-separated integers")
+            try:
+                selected_seeds = [int(token) for token in tokens]
+            except ValueError as exc:
+                raise ValueError("--training-seeds expects comma-separated integers") from exc
+
+        from adaptive_rl.benchmarking.adaptation_runner import run_adaptation_benchmark
+
+        if study not in {None, "prereg-v1", "prereg-v2"}:
+            raise ValueError("--study supports prereg-v1 or prereg-v2")
+        if (study is None) != (run_id is None):
+            raise ValueError("--study and --run-id must be supplied together")
+        if resume and study is None:
+            raise ValueError("--resume requires a preregistered --study version and --run-id")
+
+        artifact = run_adaptation_benchmark(
+            exp_config,
+            output_dir=output_dir,
+            training_seeds=selected_seeds,
+            smoke=smoke,
+            config_path=config,
+            study_run_id=run_id if study is not None else None,
+            study_version=study or "prereg-v1",
+            resume=resume,
+        )
+    except Exception as err:
+        console.print(f"[bold red]Issue #265 benchmark failed:[/bold red] {err}")
+        raise typer.Exit(code=1)
+
+    failed = artifact["failure_summary"]["failed_replicates"]
+    completed = artifact["failure_summary"]["completed_replicates"]
+    json_artifact_path = Path(artifact["artifact_paths"]["json"])
+    csv_artifact_path = Path(artifact["artifact_paths"]["csv"])
+    if study is not None and run_id is not None:
+        study_dir = (output_dir or exp_config.output_dir) / run_id
+        json_artifact_path = study_dir / json_artifact_path
+        csv_artifact_path = study_dir / csv_artifact_path
     console.print(
         Panel.fit(
-            f"[bold cyan]Running Online Adaptation Benchmark (Protocol v2.0)[/bold cyan]\n\n"
-            f"• [bold]Condition:[/bold] TEST-B (12 Obstacles, 4.0 m/s Steady Wind, 0.6 Gust Volatility)\n"
-            f"• [bold]Replicates:[/bold] {len(training_seed_list)} (Seeds: {training_seed_list})\n"
-            f"• [bold]Mode:[/bold] {'Quick Smoke Test' if quick else 'Full Protocol Run'}\n"
-            f"• [bold]Output Directory:[/bold] {output_dir}",
-            title="AdaptiveRL Benchmark",
-            border_style="cyan",
+            f"[bold]{'Smoke check' if smoke else 'Issue #265 benchmark'} finished[/bold]\n\n"
+            f"• [bold]Run type:[/bold] {artifact['run_type']}\n"
+            f"• [bold]Algorithm:[/bold] {artifact['experiment']['algorithm']}\n"
+            f"• [bold]Completed replicates:[/bold] {completed}\n"
+            f"• [bold]Failed replicates:[/bold] {len(failed)}\n"
+            f"• [bold]JSON:[/bold] {json_artifact_path}\n"
+            f"• [bold]CSV:[/bold] {csv_artifact_path}\n"
+            f"• [bold]Scientific result:[/bold] not established by harness execution",
+            title="Online Adaptation Benchmark",
+            border_style="yellow" if smoke or failed else "green",
         )
     )
-
-    runner = AdaptiveShiftRunner(
-        training_seeds=training_seed_list,
-        training_timesteps=timesteps,
-        output_dir=str(output_dir),
-        quick_test_mode=quick,
-    )
-
-    with console.status("[bold green]Executing benchmark replicates...[/bold green]"):
-        report = runner.run()
-
-    stats = report["statistics"]
-    reps = report["replicates"]
-
-    # Replicate summary table
-    table = Table(title="Replicate Results (Adaptive vs Fixed Policy)", border_style="cyan")
-    table.add_column("Rep", justify="right", style="cyan")
-    table.add_column("Seed", justify="right")
-    table.add_column("P_pre", justify="right")
-    table.add_column("P0 (Shock)", justify="right")
-    table.add_column("Fixed T_H", justify="right", style="red")
-    table.add_column("Adaptive T_H", justify="right", style="green")
-    table.add_column("D_i (Diff)", justify="right", style="bold yellow")
-    table.add_column("Fixed Status", justify="left")
-    table.add_column("Adaptive Status", justify="left")
-
-    for r in reps:
-        d_val = r["d_i"]
-        table.add_row(
-            str(r["replicate_index"]),
-            str(r["training_seed"]),
-            f"{r['fixed_recovery']['p_pre']:.2f}",
-            f"{r['fixed_recovery']['p0']:.2f}",
-            str(r["fixed_recovery"]["truncated_recovery_time"]),
-            str(r["adaptive_recovery"]["truncated_recovery_time"]),
-            f"{d_val:+.1f}",
-            r["fixed_recovery"]["status"],
-            r["adaptive_recovery"]["status"],
-        )
-
-    console.print(table)
-
-    # Statistical summary panel
-    ci = stats["confidence_interval_95"]
-    ci_str = f"[{ci[0]:.2f}, {ci[1]:.2f}]"
-    cohen_str = f"{stats['cohens_dz']:.3f}" if stats.get("cohens_dz") is not None else "N/A"
-    p_val = stats["p_value_onesided"]
-
-    decision_style = "bold green" if p_val < 0.05 and stats["mean_d"] < 0 else "bold yellow"
-
-    console.print(
-        Panel.fit(
-            f"[{decision_style}]Statistical Analysis (One-Sided Paired t-test for H1: mu_D < 0)[/{decision_style}]\n\n"
-            f"• [bold]Mean Difference (D_mean):[/bold] {stats['mean_d']:+.3f} episodes\n"
-            f"• [bold]Sample Std Dev (s_D):[/bold] {stats['std_d']:.3f}\n"
-            f"• [bold]Standard Error (SE):[/bold] {stats['se_d']:.3f}\n"
-            f"• [bold]t-statistic:[/bold] {stats['t_statistic']:.3f}\n"
-            f"• [bold]p-value (one-sided):[/bold] {p_val:.4f}\n"
-            f"• [bold]95% Confidence Interval:[/bold] {ci_str}\n"
-            f"• [bold]Cohen's d_z:[/bold] {cohen_str}\n"
-            f"• [bold]Sign Test p-value:[/bold] {stats['sign_test_p']:.4f}\n"
-            f"• [bold]Wilcoxon Signed-Rank p-value:[/bold] {stats['wilcoxon_p']:.4f}\n\n"
-            f"• [bold]JSON Report:[/bold] {output_dir / 'adaptive_vs_fixed.json'}\n"
-            f"• [bold]CSV Summary:[/bold] {output_dir / 'adaptive_vs_fixed.csv'}",
-            title="Benchmark Outcome",
-            border_style="green" if p_val < 0.05 and stats["mean_d"] < 0 else "yellow",
-        )
-    )
+    if failed:
+        raise typer.Exit(code=1)
 
 
 @app.command(context_settings={"allow_extra_args": True})

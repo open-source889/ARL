@@ -59,7 +59,7 @@ training:
 
 evaluation:
   eval_episodes: 15
-  deterministic: true
+  deterministic: false
 
 adaptation_benchmark:
   protocol_version: "2.0"
